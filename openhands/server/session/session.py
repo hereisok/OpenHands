@@ -78,6 +78,10 @@ class Session:
         self.loop = asyncio.get_event_loop()
         self.user_id = user_id
 
+        self._event_queue = asyncio.Queue()
+        self._monitor_send_queue_task = self.loop.create_task(self._monitor_send_queue())
+        self._wait_websocket_initial_complete = True
+
     async def close(self) -> None:
         if self.sio:
             await self.sio.emit(
@@ -319,17 +323,31 @@ class Session:
         self.agent_session.event_stream.add_event(event, EventSource.USER)
 
     async def send(self, data: dict[str, object]) -> None:
-        if asyncio.get_running_loop() != self.loop:
-            self.loop.create_task(self._send(data))
-            return
-        await self._send(data)
+        self._event_queue.put_nowait(data)
+
+    async def _monitor_send_queue(self):
+        while True:
+            message: dict = await self._event_queue.get()
+            await self._send(message)
 
     async def _send(self, data: dict[str, object]) -> bool:
         try:
             if not self.is_alive:
                 return False
+
+            # Wait once during initialization to avoid event push failures during websocket connection intervals
+            if self._wait_websocket_initial_complete:
+                for i in range(6):
+                    if bool(self.sio.manager.rooms.get('/', {}).get(ROOM_KEY.format(sid=self.sid))):
+                        break
+                    self.logger.warning(f"There is no listening client in the current room,"
+                                        f" waiting for the {i+1}th attempt: {self.sid}")
+                    await asyncio.sleep(0.3)
+                self._wait_websocket_initial_complete = False
+
             if self.sio:
                 await self.sio.emit('oh_event', data, to=ROOM_KEY.format(sid=self.sid))
+
             await asyncio.sleep(0.001)  # This flushes the data to the client
             self.last_active_ts = int(time.time())
             return True
